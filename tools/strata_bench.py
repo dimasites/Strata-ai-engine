@@ -612,8 +612,10 @@ def collect_machine(base: str, key: str, cfg: dict | None, gpu_arg: str | None =
     if sel:
         used = [local["gpus"][i] for i in sel if 0 <= i < len(local["gpus"])] or used
     elif len(used) > 1 and static.get("gpu_name"):
-        named = [g for g in used if g["name"] == static["gpu_name"]]
-        used = named[:1] or used[:1]
+        # #2331: a layer split names every card it reads ("A + B"); match each name, not the whole string
+        served = [n for n in static["gpu_name"].split(" + ") if n and n != "?"]
+        named = [g for g in used if g["name"] in served]
+        used = named or used[:1]
     gpu_names = [g["name"] for g in used] or ([static["gpu_name"]] if static.get("gpu_name") else [])
     m = status.get("machine") or {}
     vram_mib = (m.get("gpu") or {}).get("total_mib") or None
