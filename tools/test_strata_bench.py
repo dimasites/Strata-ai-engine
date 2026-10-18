@@ -278,6 +278,28 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(B.gpu_selection({"gpu": "0,2"}), [0, 2])
         self.assertEqual(B.gpu_selection({}, None), [])
 
+    def test_a_layer_split_shows_every_card_the_server_names(self):
+        """#2331: a split server says "A + B"; with no --gpu (a --url run) the report shows both cards, not the first."""
+        srv = FakeStrata()
+        self.addCleanup(srv.stop)
+        two = {"gpus": [{"name": "NVIDIA GeForce RTX 3060", "vram_mib": 12288, "driver": "560.1"},
+                        {"name": "NVIDIA GeForce RTX 9999", "vram_mib": 16384, "driver": "560.1"}]}
+        with mock.patch.object(B, "gpu_info_local", return_value=two), mock.patch.object(
+                B, "try_json", side_effect=lambda base, path, *a, **k: (
+                    {"hardware_static": {"gpu_name": "NVIDIA GeForce RTX 3060 + NVIDIA GeForce RTX 9999"}}
+                    if path == "/metrics" else {})):
+            m = B.collect_machine(srv.base, "", {})
+        self.assertEqual((m["gpu"], m["gpu_vram_mib"]), (["NVIDIA GeForce RTX 3060", "NVIDIA GeForce RTX 9999"], 28672))
+        same = {"gpus": [{"name": "NVIDIA GeForce RTX 3090", "vram_mib": 24576, "driver": "560.1"},
+                         {"name": "NVIDIA GeForce RTX 3090", "vram_mib": 24576, "driver": "560.1"}]}
+        with mock.patch.object(B, "gpu_info_local", return_value=same), mock.patch.object(
+                B, "try_json", side_effect=lambda base, path, *a, **k: (
+                    {"hardware_static": {"gpu_name": "NVIDIA GeForce RTX 3090 + NVIDIA GeForce RTX 3090"}}
+                    if path == "/metrics" else {})):
+            m = B.collect_machine(srv.base, "", {})
+        self.assertEqual((m["gpu"], m["gpu_vram_mib"], B.gpu_slug(m)),
+                         (["NVIDIA GeForce RTX 3090", "NVIDIA GeForce RTX 3090"], 49152, "2x-rtx-3090"))
+
     def test_the_slug_names_mixed_cards_one_by_one(self):
         """#2062: two different cards are not N copies of the first."""
         a, b = "NVIDIA GeForce RTX 5070 Ti", "NVIDIA RTX A4000"
