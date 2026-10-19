@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Strata Benchmark Visualizer</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <h1>Strata Benchmark Visualizer</h1>
+  <p class="sub">Локальные графики по <code>bench/results/*/results.json</code>. Без CDN, без сервера. Обновить данные: <code>python bench/visualizer/build_data.py</code></p>
+</header>
+
+<main>
+  <section class="controls">
+    <div class="row">
+      <label>Метрика:
+        <select id="metric">
+          <option value="prompt_tps">Prompt tok/s (выше = лучше)</option>
+          <option value="ttft_s">TTFT, сек (ниже = лучше)</option>
+          <option value="decode_tps">Decode tok/s (выше = лучше)</option>
+        </select>
+      </label>
+      <div id="ctxFilter" class="msel-wrap"></div>
+      <div id="gpuFilter" class="msel-wrap"></div>
+      <div id="modelFilter" class="msel-wrap"></div>
+      <div id="slotFilter" class="msel-wrap"></div>
+      <div id="streamFilter" class="msel-wrap"></div>
+      <label>Масштаб X:
+        <select id="xscale">
+          <option value="log">лог</option>
+          <option value="lin">лин</option>
+        </select>
+      </label>
+      <button id="allOn">Все</button>
+      <button id="allOff">Ничего</button>
+    </div>
+    <div id="runs" class="runs"></div>
+  </section>
+
+  <section class="charts">
+    <div class="chart-card">
+      <h2 id="chartTitle">Prompt tok/s</h2>
+      <canvas id="lineChart" width="1100" height="460" style="aspect-ratio:1100/460"></canvas>
+      <div id="tooltip" class="tooltip"></div>
+    </div>
+    <div class="chart-card">
+      <h2>Сборный: Prefill + Decode на одной плоскости</h2>
+      <canvas id="comboChart" width="1100" height="480" style="aspect-ratio:1100/480"></canvas>
+      <div id="comboLegend" class="legend"></div>
+      <div id="comboTooltip" class="tooltip"></div>
+    </div>
+    <div class="chart-card">
+      <h2>Многослотовые тесты: суммарный и постримный префил</h2>
+      <canvas id="slotsChart" width="1100" height="440" style="aspect-ratio:1100/440"></canvas>
+      <div id="slotsLegend" class="legend"></div>
+      <div id="slotsTooltip" class="tooltip"></div>
+    </div>
+    <div class="chart-card">
+      <h2>Short chat / Agent decode</h2>
+      <canvas id="barChart" width="1100" height="360" style="aspect-ratio:1100/360"></canvas>
+    </div>
+  </section>
+
+  <section class="table-wrap">
+    <h2>Таблица (медианы, транспонирована: строки = прогоны, столбцы = глубины контекста)</h2>
+    <div class="colcfg">
+      <span class="colcfg-title">Столбцы:</span>
+      <div id="cols" class="cols"></div>
+      <button id="colsPreset">Короткие (4K/16K/64K/128K/250K)</button>
+      <button id="colsAll">Все глубины</button>
+      <label class="chk"><input type="checkbox" id="colChat"> Short chat</label>
+      <label class="chk"><input type="checkbox" id="colAgent"> Agent</label>
+    </div>
+    <div id="table"></div>
+  </section>
+</main>
+
+<footer id="footer"></footer>
+
+<script src="data.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

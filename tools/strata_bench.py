@@ -596,7 +596,8 @@ def gpu_selection(cfg: dict | None, gpu_arg: str | None = None) -> list[int]:
     return sel
 
 
-def collect_machine(base: str, key: str, cfg: dict | None, gpu_arg: str | None = None) -> dict:
+def collect_machine(base: str, key: str, cfg: dict | None, gpu_arg: str | None = None,
+                    gpus_used: int | None = None) -> dict:
     status = try_json(base, "/v1/status", key) or {}
     metrics = try_json(base, "/metrics", key, 30) or {}
     props = try_json(base, "/props", key) or {}
@@ -634,6 +635,8 @@ def collect_machine(base: str, key: str, cfg: dict | None, gpu_arg: str | None =
     n_ctx = n_ctx or (props.get("default_generation_settings") or {}).get("n_ctx")
     return {
         "gpu": gpu_names, "gpu_vram_mib": vram_mib, "gpu_driver": (used[0].get("driver") if used else local.get("rocm_driver")),
+        "gpus_host": len(local["gpus"]) or None,
+        "gpus_used": gpus_used or (len(sel) if sel else None),
         "cuda": local.get("cuda"), "cpu": static.get("cpu_name") or cpu_name(), "cpu_cores": static.get("cores"),
         "cpu_threads": static.get("threads") or os.cpu_count(), "ram_gib": total_ram_gib(),
         "os": f"{platform.system()} {platform.release()} ({platform.version()})" if os.name == "nt" else f"{platform.system()} {platform.release()}",
@@ -750,6 +753,11 @@ def gpu_slug(machine: dict) -> str:
     names = machine.get("gpu") or []
     if not names:
         return "cpu"
+    # a run on part of the cards the PC has is named "2x1x-rtx-3090": host x used, then the card
+    host = machine.get("gpus_host") or len(names)
+    used = machine.get("gpus_used") or len(names)
+    if used < len(names):
+        names = names[:used]
     # #2062: the cards one by one when they differ (rtx-5070-ti-plus-rtx-a4000), "2x-" only for identical ones
     groups: list[list] = []                              # [name, count], in the order the cards are listed
     for name in names:
@@ -762,7 +770,8 @@ def gpu_slug(machine: dict) -> str:
     for name, count in groups:
         n = re.sub(r"(?i)\b(nvidia|geforce|amd|radeon|intel|graphics|corporation)\b", " ", name)
         parts.append(slug(n, 30) if count == 1 else f"{count}x-{slug(n, 30)}")
-    return "-plus-".join(parts)[:80].strip("-")
+    prefix = f"{host}x{used}x-" if used < host else ""
+    return (prefix + "-plus-".join(parts))[:80].strip("-")
 
 
 def model_label(machine: dict) -> str:
@@ -925,6 +934,8 @@ def main(argv=None) -> int:
     ap.add_argument("--url", help="use the server already running at this address (http://127.0.0.1:8080) instead of starting one")
     ap.add_argument("--port", type=int, help="the port to start the server on (default: the config's)")
     ap.add_argument("--gpu", help="start the server on this GPU only (as the server's --gpu)")
+    ap.add_argument("--gpus-used", type=int, default=None, dest="gpus_used",
+                    help="how many of the PC's cards the server actually uses (for --url runs the tool cannot inspect)")
     ap.add_argument("--api-key", default=os.environ.get("STRATA_KEY", ""), help="the server's API key, if it has one (or STRATA_KEY)")
     ap.add_argument("--runs", type=int, default=3, help="runs per test (default 3)")
     ap.add_argument("--clients", type=int, default=0, metavar="N", help="also send N requests at once")
@@ -988,14 +999,14 @@ def main(argv=None) -> int:
                 print("The server did not become ready. Last log lines:\n" + red("\n".join(tail)), file=sys.stderr)
                 return 1
         t0 = time.time()
-        pre = collect_machine(base, key, cfg, a.gpu)
+        pre = collect_machine(base, key, cfg, a.gpu, a.gpus_used)
         suite = Suite(base, key, pre.get("context"), max(1, a.runs), a.think, log=say, want_clients=a.clients, want_long=a.long)
         slots = pre.get("parallel_slots") or 1
         if a.clients and a.clients > slots:
             say(f"Note: the server runs {slots} request(s) at a time (--batch), so {a.clients} clients will partly wait their turn.")
         say("Running the suite (about 3-10 minutes) ...")
         out = suite.run()
-        machine = collect_machine(base, key, cfg, a.gpu)      # again: VRAM and the cache after the work
+        machine = collect_machine(base, key, cfg, a.gpu, a.gpus_used)   # again: VRAM and the cache after the work
         if not machine.get("gpu"):
             machine["gpu"] = pre.get("gpu")
         res = {"schema": SCHEMA, "tool": "tools/strata_bench.py", "date": datetime.date.today().isoformat(),

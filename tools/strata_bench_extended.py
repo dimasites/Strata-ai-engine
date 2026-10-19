@@ -14,7 +14,12 @@ tok/s at nine prompt sizes:
 
 Three fresh runs per size, medians with ranges. The largest size (250K = 256000
 tokens) plus the 24 generated tokens must fit the server's context, so run it on a
-context of at least 262144. The report goes to bench/results/<date>-extended-<gpu>-<model>/
+context of at least 262144. With --parallel N each size that fits N streams is also
+run as N fresh prompts sent at the same moment (the simultaneous prefill): total
+prompt tok/s, per-stream tok/s, TTFT p50/p95 and the scaling against the single
+stream, and while each burst runs `GET /slots` is polled once a second so the number
+of slots busy at the same moment is measured. The report goes to
+bench/results/<date>-extended-<gpu>-<model>/
 in the format of docs/COMMUNITY_BENCHMARKS.md. Standard library only.
 """
 from __future__ import annotations
@@ -22,26 +27,51 @@ from __future__ import annotations
 import argparse
 import datetime
 import json
+import statistics
 import sys
+import threading
 import time
+import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from ab_engine import long_prompt                                    # noqa: E402
-from strata_bench import (chat, digest, stat, fmt, collect_machine,  # noqa: E402
+from strata_bench import (chat, digest, stat, fmt, pctl, collect_machine,  # noqa: E402
                           is_strata, start_server, wait_ready, stop_server,
                           redactor, gpu_slug, model_label, ROOT)
 
 # The nine prompt sizes, in tokens (K = 1024), matching the original's 4K/16K/32K.
 LENGTHS = [4096, 16384, 32768, 65536, 88064, 131072, 153600, 188416, 256000]
+# The parallel sweep by default: the sizes a parallel batch is asked about (32K/64K/128K/250K).
+PARALLEL_LENGTHS = [32768, 65536, 131072, 256000]
 GEN_TOKENS = 24          # the original's LONG_MAX_TOKENS: prefill-focused, minimal decode
 MARGIN = 256             # the original suite's margin (strata_bench.py): a calibrated prompt can come out longer than the target
 SAFE_CTX_UNKNOWN = 32768  # the original suite's longest prompt: what to try when the server did not report its context
-SCHEMA = "extended-1"
+ETA_PREFILL_TPS = 1500   # the prefill speed the run-time estimate is made at (the plan's reference number)
+SCHEMA = "extended-3"
 
 
 def size_label(tokens: int) -> str:
     return f"{tokens // 1024}K"
+
+
+def slot_sampler(base: str, key: str, stop, out: list, every: float = 1.0):
+    """Poll `GET /slots` (one entry per slot: is_processing, n_prompt_tokens) until `stop` is set,
+    appending {t, n_busy, busy, prompt_tokens} per sample. A failed poll is recorded, not fatal."""
+    hdr = {"Content-Type": "application/json"}
+    if key:
+        hdr["Authorization"] = "Bearer " + key
+    t0 = time.perf_counter()
+    while not stop.is_set():
+        try:
+            with urllib.request.urlopen(urllib.request.Request(base + "/slots", headers=hdr), timeout=10) as r:
+                slots = json.loads(r.read().decode())
+            busy = [s.get("id") for s in slots if s.get("is_processing")]
+            out.append({"t": round(time.perf_counter() - t0, 1), "n_busy": len(busy), "busy": busy,
+                        "prompt_tokens": {s.get("id"): s.get("n_prompt_tokens") for s in slots}})
+        except Exception as e:                                          # noqa: BLE001
+            out.append({"t": round(time.perf_counter() - t0, 1), "err": repr(e)})
+        stop.wait(every)
 
 
 class Extended:
@@ -107,6 +137,94 @@ class Extended:
                 "failures": [r for row in rows for x in row["runs"] if not x.get("ok")]}
 
 
+class Parallel:
+    """N fresh prompts of the same size start together (a barrier): the simultaneous prefill the
+    sequential sweep cannot show - total prompt tok/s, per-stream degradation, queueing on the slots.
+    While the burst runs, `GET /slots` is polled once a second, so the number of slots busy at the same
+    moment is measured and not inferred."""
+
+    def __init__(self, ext: Extended, slots: int | None, n: int, runs: int, log=print):
+        self.ext, self.slots, self.n, self.runs, self.log = ext, slots, max(1, n), max(1, runs), log
+
+    def burst(self, tokens: int, run: int) -> dict:
+        n = self.n
+        barrier = threading.Barrier(n)
+        res: dict = {}
+
+        def one(i: int):
+            msgs = self.ext.prompt_for(tokens, run * 100 + i)
+            barrier.wait()
+            res[i] = digest(chat(self.ext.base, self.ext.key, msgs, GEN_TOKENS, timeout=3600))
+
+        stop = threading.Event()
+        trace: list = []
+        sampler = threading.Thread(target=slot_sampler,
+                                   args=(self.ext.base, self.ext.key, stop, trace), daemon=True)
+        th = [threading.Thread(target=one, args=(i,)) for i in range(n)]
+        sampler.start()
+        t0 = time.perf_counter()
+        for t in th:
+            t.start()
+        for t in th:
+            t.join()
+        wall = time.perf_counter() - t0
+        stop.set()
+        sampler.join(timeout=5)
+        good = [d for d in res.values() if d.get("ok")]
+        toks = sum(d.get("prompt_tokens") or 0 for d in good)
+        gen = sum(d.get("generated_tokens") or 0 for d in good)
+        busy = [s.get("n_busy") for s in trace if s.get("n_busy") is not None]
+        peak = max(busy) if busy else 0
+        return {"round": run, "wall_s": round(wall, 2), "ok": len(good),
+                "total_prompt_tps": round(toks / wall, 1) if toks and good else None,
+                "total_tps": round((toks + gen) / wall, 1) if good and toks else None,
+                "stream_prompt_tps": [d.get("prompt_tps") for d in good if d.get("prompt_tps") is not None],
+                "ttft_s": sorted(d["ttft_s"] for d in good if d.get("ttft_s") is not None),
+                "slots_busy_peak": peak,
+                "slots_busy_samples": len(busy),
+                "slots_busy_median": round(statistics.median(busy), 1) if busy else None,
+                "slots_at_peak": [s.get("prompt_tokens") for s in trace if s.get("n_busy") == peak][:3],
+                "errors": [d.get("err") for d in res.values() if d.get("err")][:3]}
+
+    def run(self, single: dict) -> dict:
+        rows = []
+        for tokens in PARALLEL_LENGTHS:
+            label = size_label(tokens)
+            cap = self.ext.ctx or SAFE_CTX_UNKNOWN
+            if self.n * (tokens + GEN_TOKENS + MARGIN) > cap:
+                why = (f"the context is {self.ext.ctx} tokens for {self.n} streams"
+                       if self.ext.ctx else f"the context was not read (trying up to {SAFE_CTX_UNKNOWN} tokens)")
+                self.log(f"  {label} x {self.n}: skipped ({why})")
+                rows.append({"target": tokens, "label": label, "streams": self.n, "ok": 0, "skipped": why})
+                continue
+            queued = bool(self.slots and self.n > self.slots)
+            eta = round(self.n * tokens / ETA_PREFILL_TPS, 1)
+            self.log(f"{label} x {self.n} streams at once, {self.runs} rounds, ETA ~{eta} s per round "
+                     f"(prefill {ETA_PREFILL_TPS} tok/s)" + ("  (more streams than slots: queued)" if queued else ""))
+            rounds = [self.burst(tokens, r) for r in range(self.runs)]
+            good = [r for r in rounds if r["ok"] == self.n]
+            for r in rounds:
+                if r["errors"]:
+                    self.log(f"  round {r['round'] + 1}: {r['ok']}/{self.n} ok, errors: {r['errors'][:1]}")
+                elif r["ok"] == self.n:
+                    self.log(f"  round {r['round'] + 1}: {rounds[0]['wall_s']} s wall, {r['total_prompt_tps']} tok/s total")
+            ttft = [x for r in good for x in r["ttft_s"]]
+            med = (single.get(label) or {}).get("median")
+            tot = stat(r["total_prompt_tps"] for r in good)
+            rows.append({"target": tokens, "label": label, "streams": self.n, "queued": queued,
+                         "rounds": rounds, "ok": len(good),
+                         "wall_s": stat(r["wall_s"] for r in good),
+                         "total_prompt_tps": tot,
+                         "total_tps": stat(r["total_tps"] for r in good),
+                         "per_stream_prompt_tps": stat(x for r in good for x in r["stream_prompt_tps"]),
+                          "ttft_p50_s": round(pctl(ttft, .5), 2) if ttft else None,
+                          "ttft_p95_s": round(pctl(ttft, .95), 2) if ttft else None,
+                          "slots_busy_peak": max((r.get("slots_busy_peak") or 0) for r in rounds),
+                          "scaling": round(tot["median"] / med, 2) if tot and med else None})
+        return {"schema": SCHEMA, "streams": self.n, "rows": rows,
+                "failures": [e for r in rows for rd in r.get("rounds", []) for e in rd["errors"]]}
+
+
 def write_report(res: dict, machine: dict, parent: Path, red) -> Path:
     name = f"{res['date']}-extended-{gpu_slug(machine)}-{model_label(machine)}"
     d = parent / name
@@ -132,7 +250,8 @@ def write_report(res: dict, machine: dict, parent: Path, red) -> Path:
          "## Model and configuration", "",
          f"- Model and quantization: {model}",
          f"- Context: {machine.get('context')} tokens; parallel slots: {machine.get('parallel_slots')}",
-         f"- Prompt sizes: {', '.join(size_label(t) for t in res['params']['lengths'])} (K = 1024 tokens); generated tokens: {res['gen_tokens']}",
+          f"- Prompt sizes: {', '.join(size_label(t) for t in res['params']['lengths'])} (K = 1024 tokens); generated tokens: {res['gen_tokens']}"
+          + (f"; parallel streams: {res['parallel']['streams']} x {res['parallel_runs']} rounds" if res.get("parallel") else ""),
          "",
          "## Method", "",
          "Run against the HTTP API of a Strata server (started by this tool from the config, or an already running one "
@@ -153,9 +272,33 @@ def write_report(res: dict, machine: dict, parent: Path, red) -> Path:
         L.append(f"| {row['label']} | {ptk_s} | {res['gen_tokens']} cap | {row['ok']} | {pt} | {tt} | {dc} |")
     L += ["",
           "Ranges are the lowest and highest of the runs; `Runs` counts requests that returned a token.",
-          "",
-          "Per-request data: `results.json`.",
           ""]
+    par = res.get("parallel")
+    if par:
+        n = par["streams"]
+        L += [f"## Parallel: {n} streams at once", "",
+              f"{n} fresh prompts of the same size start together (a barrier), {res['parallel_runs']} rounds, "
+              f"on the parallel sizes {', '.join(r['label'] for r in par['rows'])}. "
+              f"Total prompt tok/s is the sum of the prompt tokens over the wall time of the burst - the "
+              f"simultaneous prefill; per-stream is the median over the streams (its drop against the "
+              f"single-stream column above is the interference); scaling is the total over the single-stream "
+               f"median of the same size. TTFT p50/p95 show the queueing on the slots. `Slots busy` is the highest "
+               f"number of slots `GET /slots` reported processing at the same instant during the burst - the slots "
+               f"measured at work, not assumed.", "",
+               "| Prompt size | Streams | Wall seconds | Total prompt tok/s | Per-stream prompt tok/s | TTFT p50 / p95 s | Slots busy | Scaling × |",
+               "| --- | ---: | ---: | ---: | --- | --- | ---: | ---: |"]
+        for row in par["rows"]:
+            if row.get("skipped"):
+                L.append(f"| {row['label']} | {n} | skipped ({row['skipped']}) | | | | | | |")
+                continue
+            q = " (queued: more streams than slots)" if row.get("queued") else ""
+            tt = (f"{row['ttft_p50_s']} / {row['ttft_p95_s']}"
+                  if row["ttft_p50_s"] is not None else "not measured")
+            sc = f"{row['scaling']:.2f}" if row["scaling"] is not None else "not measured"
+            L.append(f"| {row['label']} | {n}{q} | {fmt(row['wall_s'], 1)} | {fmt(row['total_prompt_tps'], 1)} "
+                     f"| {fmt(row['per_stream_prompt_tps'], 1)} | {tt} | {row.get('slots_busy_peak')} | {sc} |")
+        L.append("")
+    L += ["Per-request data: `results.json`.", ""]
     (d / "README.md").write_text(red("\n".join(L)), encoding="utf-8")
     (d / "results.json").write_text(json.dumps(redact(res, red), ensure_ascii=False, indent=1), encoding="utf-8")
     return d
@@ -175,7 +318,13 @@ def main(argv=None) -> int:
     ap.add_argument("--url", help="use the server already running at this address (http://127.0.0.1:8081)")
     ap.add_argument("--port", type=int, help="the port to start the server on (default: the config's)")
     ap.add_argument("--api-key", default="", help="the server's API key, if it has one")
+    ap.add_argument("--gpus-used", type=int, default=None, dest="gpus_used",
+                    help="how many of the PC's cards the server actually uses (for --url runs the tool cannot inspect)")
     ap.add_argument("--runs", type=int, default=3, help="runs per prompt size (default 3)")
+    ap.add_argument("--parallel", type=int, default=0,
+                    help="also send N fresh prompts of each size at once (the simultaneous prefill); 0 = off")
+    ap.add_argument("--parallel-runs", type=int, default=None,
+                    help="rounds per size in the parallel sweep; when --parallel is on and this is not given, the tool asks")
     ap.add_argument("--out", help="where to write the results folder (default: bench/results)")
     ap.add_argument("--ready-timeout", type=float, default=1800, help="seconds to wait for the model to load")
     ap.add_argument("--quiet", action="store_true")
@@ -216,23 +365,48 @@ def main(argv=None) -> int:
             if not wait_ready(base, key, proc, a.ready_timeout, print):
                 print("The server did not become ready.", file=sys.stderr)
                 return 1
-        pre = collect_machine(base, key, cfg, None)
+        pre = collect_machine(base, key, cfg, None, a.gpus_used)
         ext = Extended(base, key, pre.get("context"), max(1, a.runs), log=(lambda *x: None) if a.quiet else print)
         print(f"Running the extended sweep ({len(LENGTHS)} sizes x {a.runs} runs) ...")
         out = ext.run()
-        machine = collect_machine(base, key, cfg, None)
+        par_out = None
+        par_runs = 0
+        if a.parallel > 0:
+            par_runs = a.parallel_runs
+            if par_runs is None:                       # the number of rounds is asked, not assumed
+                try:
+                    ans = input(f"Parallel runs per size (32K/64K/128K/250K x {a.parallel} streams), 2 recommended [2]: ").strip()
+                    par_runs = int(ans) if ans else 2
+                except (EOFError, ValueError):
+                    par_runs = 2
+                    print("No answer read; using 2 rounds.")
+                par_runs = max(1, par_runs)
+            print(f"Running the parallel sweep ({len(PARALLEL_LENGTHS)} sizes x {par_runs} rounds x {a.parallel} streams) ...")
+            single = {r["label"]: r["prompt_tps"] for r in out["rows"]}
+            par_out = Parallel(ext, pre.get("parallel_slots"), a.parallel, par_runs,
+                               log=(lambda *x: None) if a.quiet else print).run(single)
+        machine = collect_machine(base, key, cfg, None, a.gpus_used)
         if not machine.get("gpu"):
             machine["gpu"] = pre.get("gpu")
         res = {"schema": SCHEMA, "tool": "tools/strata_bench_extended.py",
                "date": datetime.date.today().isoformat(),
                "params": {"runs": a.runs, "lengths": LENGTHS, "gen_tokens": GEN_TOKENS},
-               "machine": machine, "results": out, "runs": a.runs, "gen_tokens": GEN_TOKENS}
+               "machine": machine, "results": out, "runs": a.runs, "gen_tokens": GEN_TOKENS,
+               "parallel": par_out, "parallel_runs": par_runs}
         parent = Path(a.out) if a.out else ROOT / "bench" / "results"
         d = write_report(res, machine, parent, red)
         print("\nExtended sweep (median, range over the runs):")
         for row in out["rows"]:
             print(f"  {row['label']:>5}: prompt {fmt(row['prompt_tps'], 1)}  TTFT {fmt(row['ttft_s'], 2)}  "
                   f"decode {fmt(row['decode_tps'], 1)}")
+        if par_out:
+            print(f"\nParallel sweep ({par_out['streams']} streams at once, median):")
+            for row in par_out["rows"]:
+                if row.get("skipped"):
+                    continue
+                print(f"  {row['label']:>5}: total {fmt(row['total_prompt_tps'], 1)}  per-stream "
+                      f"{fmt(row['per_stream_prompt_tps'], 1)}  slots busy {row.get('slots_busy_peak')}  "
+                      f"scaling {row['scaling']}")
         print(f"\nReport: {d / 'README.md'}")
         return 1 if out["failures"] and not any(r["ok"] for r in out["rows"]) else 0
     finally:
